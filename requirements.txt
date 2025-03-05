@@ -9,3 +9,4 @@ geopy
 transformers
 torch
 huggingface_hub
+mysql-connector-python
