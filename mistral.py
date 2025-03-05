@@ -18,9 +18,7 @@ login(token = huggingface_api_key)
 
 app = FastAPI()
 
-# Load models
-xgb_model = joblib.load("xgboost_model.pkl")
-kmeans_model = joblib.load("kmeans_model.pkl")
+
 
 # Load Mistral-7B model and tokenizer
 tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.1")
