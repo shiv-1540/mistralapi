@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import mysql.connector
 import joblib
@@ -13,21 +13,19 @@ load_dotenv()
 huggingface_api_key = os.getenv('HUGGINGFACE_API_KEY')
 
 # Login to Hugging Face Hub
-if huggingface_api_key:
-    login(token=huggingface_api_key)
-else:
+if not huggingface_api_key:
     raise ValueError("Missing Hugging Face API Key!")
+login(token=huggingface_api_key)
 
 app = FastAPI()
 
 # Load models
 try:
-    xgb_model = joblib.load("xgboost_model.pkl")
-    kmeans_model = joblib.load("kmeans_model.pkl")
-    
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.1")
     model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-Instruct-v0.1", load_in_8bit=True)
     genai_pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer)
+    xgb_model = joblib.load("xgboost_model.pkl")
+    kmeans_model = joblib.load("kmeans_model.pkl")
 except Exception as e:
     raise RuntimeError(f"Error loading models: {e}")
 
@@ -60,34 +58,49 @@ async def analyze_impact(user_loc: UserLocation):
         """
         cursor.execute(query)
         stores = cursor.fetchall()
-    
+
     except mysql.connector.Error as err:
-        return {"error": f"Database error: {err}"}
+        raise HTTPException(status_code=500, detail=f"Database error: {err}")
     finally:
-        cursor.close()
-        conn.close()
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+    if not stores:
+        raise HTTPException(status_code=404, detail="No stores found in the database.")
 
     # Find nearby stores
-    nearby_stores = [
-        {**store, 'distance_km': geodesic((user_loc.latitude, user_loc.longitude), (store['latitude'], store['longitude'])).km}
-        for store in stores
-        if geodesic((user_loc.latitude, user_loc.longitude), (store['latitude'], store['longitude'])).km <= user_loc.min_distance_km
-    ]
+    nearby_stores = []
+    for store in stores:
+        distance = geodesic((user_loc.latitude, user_loc.longitude), (store['latitude'], store['longitude'])).km
+        if distance <= user_loc.min_distance_km:
+            store['distance_km'] = distance
+            nearby_stores.append(store)
+
+    if not nearby_stores:
+        return {"message": "No stores found within the specified distance."}
 
     # Predict delivery times
-    predictions = [
-        {"store_id": store['id'], "predicted_time": xgb_model.predict([[store['distance_km'], store['orders_served'], store['traffic_density'], store['capacity']]])[0]}
-        for store in nearby_stores
-    ]
+    predictions = []
+    for store in nearby_stores:
+        try:
+            features = [[store['distance_km'], store['orders_served'], store['traffic_density'], store['capacity']]]
+            predicted_time = xgb_model.predict(features)[0]
+            predictions.append({"store_id": store['id'], "predicted_time": predicted_time})
+        except Exception as e:
+            predictions.append({"store_id": store['id'], "error": f"Prediction failed: {e}"})
 
     # Cluster analysis for new store locations
     store_coords = [(store['latitude'], store['longitude']) for store in nearby_stores]
-    if store_coords:
-        kmeans_model.set_params(n_clusters=user_loc.n_clusters)
-        kmeans_model.fit(store_coords)
-        new_store_coords = kmeans_model.cluster_centers_.tolist()
-    else:
-        new_store_coords = []
+    new_store_coords = []
+    if len(store_coords) >= user_loc.n_clusters:
+        try:
+            kmeans_model.set_params(n_clusters=user_loc.n_clusters)
+            kmeans_model.fit(store_coords)
+            new_store_coords = kmeans_model.cluster_centers_.tolist()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Clustering failed: {e}")
 
     # Generate business insights with Mistral
     insights_prompt = f"""
@@ -96,7 +109,7 @@ async def analyze_impact(user_loc: UserLocation):
     If new stores are opened at {new_store_coords}, how would this impact delivery times, store loads, and customer satisfaction?
     Provide a detailed business-level summary.
     """
-    
+
     try:
         insight_response = genai_pipeline(insights_prompt, max_length=500, num_return_sequences=1)
         business_insights = insight_response[0]['generated_text']
